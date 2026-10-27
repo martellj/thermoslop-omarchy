@@ -40,7 +40,7 @@ It never edits Omarchy or system configuration.
 ## Install
 
 ```bash
-uv tool install thermoslop      # the CLI, the watcher and the MCP server
+uv tool install --managed-python thermoslop   # the CLI, the watcher and the MCP server
 thermoslop setup                # starts the watcher; on Omarchy offers to add this plugin
 thermoslop discover             # find your thermostats
 thermoslop pair <device id>     # or pair from the widget's panel: + ADD THERMOSTAT
@@ -75,12 +75,18 @@ HomeKit).
 - **Bar:** an icon (heating, cooling, away) and each thermostat's
   temperature, grouped by house.
 - **Left click:** the panel.
-  - Per-thermostat cards: ring gauge, humidity, setpoint − / +, trend line.
-  - A mode bar: heat, cool, eco (away), hold (resume the schedule).
+  - Per-thermostat cards: ring gauge, humidity, setpoint − / +, trend line,
+    and the card's own HEAT / COOL / OFF / AWAY / RESUME. Each acts on that
+    thermostat only.
+  - The setpoint is read from the thermostat before you can change it, and
+    the exact value you see is what gets sent.
+  - A house with several thermostats gets AWAY ALL / RESUME ALL, confirmed
+    by a second press.
   - **+ ADD THERMOSTAT** to pair.
-- **Right click:** away on all thermostats, or resume if any is away.
-- **Middle click:** resume the schedule.
-- **Scroll:** setpoint ±1°.
+- **Right click:** away, or resume if away, for the one thermostat or house
+  the widget shows. With several houses shown, it opens the panel.
+- **Middle click:** resume the schedule (same scope as right click).
+- **Scroll:** setpoint ±1°, only when the widget shows one thermostat.
 
 Settings, on the widget's entry in `~/.config/omarchy/shell.json`:
 
@@ -88,6 +94,7 @@ Settings, on the widget's entry in `~/.config/omarchy/shell.json`:
 |---|---|
 | `"thermostat": "upstairs"` | Show and control only this thermostat |
 | `"house": "cabin"` | Only this house's thermostats |
+| `"demo": true` | Pretend thermostats in the bar and panel, to try the controls; nothing is read or sent |
 | `"pairingDemo": true` | "Add thermostat" pairs with a pretend thermostat; nothing is saved |
 
 From scripts or keybindings:
