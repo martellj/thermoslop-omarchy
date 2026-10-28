@@ -12,6 +12,8 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "contrast.js" as Contrast
+import "house.js" as House
 
 Panel {
   id: root
@@ -70,13 +72,20 @@ Panel {
   }
 
   readonly property color fg: Color.popups.text
-  readonly property color accent: Color.accent
-  readonly property color cool: "#6cb6d9"
-  readonly property color good: "#5fd38d"
-  readonly property color bad: Color.urgent
-  readonly property color dim: Qt.darker(fg, 1.5)
   readonly property color surface: Util.alpha(fg, 0.035)
   readonly property color hairline: Util.alpha(fg, 0.10)
+  // Text and controls sit on the cards: the popup background with `surface`
+  // over it. Each color below is the theme's own, unless it's hard to read
+  // there; then it's moved toward black or white just enough (contrast.js):
+  // 4.5:1 for text, 3:1 for control outlines (WCAG 1.4.3, 1.4.11).
+  readonly property var card: Contrast.blend(fg, Color.popups.background, 0.035)
+  function readable(c) { const o = Contrast.readable(c, root.card, 4.5); return Qt.rgba(o.r, o.g, o.b, 1) }
+  readonly property color accent: readable(Color.accent)
+  readonly property color cool: readable(Qt.color("#6cb6d9"))
+  readonly property color good: readable(Qt.color("#5fd38d"))
+  readonly property color bad: readable(Color.urgent)
+  readonly property color dim: readable(Qt.darker(fg, 1.5))
+  readonly property color outline: Util.alpha(fg, Contrast.alphaFor(fg, card, 3, 0.18))
   readonly property string font: root.bar ? root.bar.fontFamily : Style.font.family
   readonly property int radius: Style.space(10)
 
@@ -87,7 +96,7 @@ Panel {
     for (const alias in root.controls) root.controls[alias].read()
   }
   function openFromHotkey() { open() }
-  function close() { root.controller.hide() }
+  function close() { root.cursorActive = false; root.controller.hide() }
   function toggle() { root.opened ? close() : open() }
 
   // ---- helpers
@@ -123,6 +132,22 @@ Panel {
     if (t.mode === "cool") return (t.target ?? t.cool_setpoint) - t.temperature
     if (t.mode === "auto") return Math.min(t.temperature - t.heat_setpoint, t.cool_setpoint - t.temperature)
     return null
+  }
+
+  // "Room 1.2°F above target", "Room 0.5°F below range", "Room within range".
+  function targetWords(t) {
+    if (!t.available || t.temperature === null || t.temperature === undefined) return ""
+    const u = "°" + (t.units === "C" ? "C" : "F")
+    const off = (d, what) => Math.abs(d) < 0.05 ? "Room at " + what
+      : "Room " + Math.abs(d).toFixed(1) + u + (d > 0 ? " above " : " below ") + what
+    if (t.mode === "heat") return off(t.temperature - (t.target ?? t.heat_setpoint), "target")
+    if (t.mode === "cool") return off(t.temperature - (t.target ?? t.cool_setpoint), "target")
+    if (t.mode === "auto") {
+      if (t.temperature < t.heat_setpoint) return off(t.temperature - t.heat_setpoint, "range")
+      if (t.temperature > t.cool_setpoint) return off(t.temperature - t.cool_setpoint, "range")
+      return "Room within range"
+    }
+    return ""
   }
 
   function ago(seconds) {
@@ -169,7 +194,70 @@ Panel {
     root.armed = ""
     disarm.stop()
     if (root.hostWidget && root.hostWidget.demo) return
-    run(root.cli + " " + action + " --all" + (house ? " --house " + Util.shellQuote(house) : ""))
+    // Exactly the thermostats the confirmation counted (house.js).
+    run(House.command(root.cli, action, house, root.houseZones(house).map(t => t.alias), Util.shellQuote))
+  }
+
+  // ---- keyboard: one cursor over the cards, Omarchy-style (PanelKeyCatcher).
+  // The first arrow press shows it; arrows (or h/j/k/l) move it, Enter/Space
+  // activate, + and - adjust the card it's on. Rows, top to bottom: a house's
+  // AWAY ALL / RESUME ALL, then per card its −/+ and its mode chips; last,
+  // + ADD THERMOSTAT.
+  property bool cursorActive: false
+  property int cursorRow: 0
+  property int cursorCol: 0
+  readonly property var cursorRows: {
+    const rows = []
+    root.zones.forEach((t, i) => {
+      const firstOfHouse = i === 0 || root.zones[i - 1].house !== t.house
+      if (root.multiHouse && firstOfHouse && root.houseZones(t.house).length > 1)
+        rows.push({ kind: "house", key: t.house || "", cols: 2 })
+      rows.push({ kind: "set", key: i, cols: 2 })
+      rows.push({ kind: "mode", key: i, cols: 5 })
+    })
+    const only = root.zones.length ? (root.zones[0].house || "") : ""
+    if (!root.multiHouse && root.houseZones(only).length > 1) rows.push({ kind: "house", key: only, cols: 2 })
+    rows.push({ kind: "add", key: "", cols: 1 })
+    return rows
+  }
+
+  function cursorOn(kind, key, col) {
+    const row = root.cursorRows[root.cursorRow]
+    return root.cursorActive && root.view === "zones" && !!row && row.kind === kind && row.key === key && root.cursorCol === col
+  }
+
+  function moveCursor(dx, dy) {
+    if (root.view !== "zones") return
+    if (!root.cursorActive) { root.cursorActive = true; return }
+    const last = root.cursorRows.length - 1
+    root.cursorRow = Math.max(0, Math.min(last, root.cursorRow + dy))
+    const cols = root.cursorRows[root.cursorRow].cols
+    root.cursorCol = Math.max(0, Math.min(cols - 1, root.cursorCol + dx))
+  }
+
+  function activateCursor() {
+    const row = root.cursorRows[root.cursorRow]
+    if (!root.cursorActive || root.view !== "zones" || !row) return
+    if (row.kind === "set") root.nudge(root.zones[row.key], root.cursorCol === 0 ? -1 : 1)
+    else if (row.kind === "mode") root.activateMode(row.key, root.cursorCol)
+    else if (row.kind === "house") root.houseAction(root.cursorCol === 0 ? "away" : "resume", row.key)
+    else if (row.kind === "add") root.startAdding()
+  }
+
+  // + / - on whichever card the cursor is on.
+  function adjustCursorCard(step) {
+    const row = root.cursorRows[root.cursorRow]
+    if (root.cursorActive && row && (row.kind === "set" || row.kind === "mode")) root.nudge(root.zones[row.key], step)
+  }
+
+  // A card's mode chips, by column: heat, cool, off, away (toggle), resume.
+  function activateMode(i, col) {
+    const t = root.zones[i]
+    const c = t ? root.control(t.alias) : null
+    if (!root.cliOk || !t || !t.available || !c || c.busy) return
+    const s = c.base || t
+    if (col === 4 && s.comfort !== "hold" && s.comfort !== "away") return
+    c.act([["mode", "heat"], ["mode", "cool"], ["mode", "off"], [s.comfort === "away" ? "resume" : "away"], ["resume"]][col])
   }
 
   function houseLabel(action, house) {
@@ -321,6 +409,12 @@ Panel {
       blocked: codeField.activeFocus
       onCloseRequested: root.view === "add" ? root.stopAdding() : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) { root.moveCursor(dx, dy) }
+      onActivateRequested: root.activateCursor()
+      onTextKey: function(t) {
+        if (t === "+" || t === "=") root.adjustCursorCard(1)
+        else if (t === "-" || t === "_") root.adjustCursorCard(-1)
+      }
 
       Flickable {
         id: scroll
@@ -403,6 +497,7 @@ Panel {
                     radius: width / 2
                     anchors.verticalCenter: parent.verticalCenter
                     color: parent.fresh ? root.good : root.bad
+                    Accessible.ignored: true  // the status text next to it says the same
                   }
                   Text {
                     textFormat: Text.PlainText
@@ -417,7 +512,7 @@ Panel {
                       : "watcher offline · run: thermoslop setup"
                     color: root.dim
                     font.family: root.font
-                    font.pixelSize: Style.font.bodySmall
+                    font.pixelSize: Style.font.body
                   }
                 }
               }
@@ -474,7 +569,7 @@ Panel {
                 text: "Then restart the shell: omarchy restart shell"
                 color: root.dim
                 font.family: root.font
-                font.pixelSize: Style.font.bodySmall
+                font.pixelSize: Style.font.body
               }
             }
           }
@@ -542,6 +637,7 @@ Panel {
                         radius: width / 2
                         anchors.verticalCenter: parent.verticalCenter
                         color: zone.t.available ? (zone.t.action === "idle" ? root.accent : root.actionColor(zone.t)) : root.bad
+                        Accessible.ignored: true  // the action badge says the same in words
                       }
                       Text {
                         textFormat: Text.PlainText
@@ -587,6 +683,8 @@ Panel {
                       value: zone.t.temperature
                       tint: zone.t.mode === "cool" ? root.cool : root.accent
                       glyph: root.modeGlyph(zone.t.mode)
+                      accessibleName: (zone.t.name || zone.t.alias) + ", " + root.num(zone.t.temperature, 1) + " degrees, "
+                        + (zone.t.mode || "unknown") + " mode"
                     }
 
                     Column {
@@ -659,7 +757,9 @@ Panel {
                           readonly property bool adjustable: root.cliOk && !!zone.c && zone.c.adjustable
                           StepButton {
                             text: "−"
+                            accessibleName: "Lower " + (zone.t.name || zone.t.alias) + " setpoint"
                             enabled: parent.adjustable
+                            hasCursor: root.cursorOn("set", zone.index, 0)
                             onClicked: root.nudge(zone.t, -1)
                           }
                           Text {
@@ -674,7 +774,9 @@ Panel {
                           }
                           StepButton {
                             text: "+"
+                            accessibleName: "Raise " + (zone.t.name || zone.t.alias) + " setpoint"
                             enabled: parent.adjustable
+                            hasCursor: root.cursorOn("set", zone.index, 1)
                             onClicked: root.nudge(zone.t, 1)
                           }
                         }
@@ -687,7 +789,7 @@ Panel {
                           text: zone.c ? zone.c.note : ""
                           color: zone.c && zone.c.phase === "unknown" ? root.bad : root.dim
                           font.family: root.font
-                          font.pixelSize: Style.font.caption
+                          font.pixelSize: Style.font.body
                         }
                       }
                     }
@@ -702,30 +804,40 @@ Panel {
                     readonly property real cell: (width - spacing * 4) / 5
                     Chip {
                       width: parent.cell; label: "HEAT"; glyph: "󰈸"
+                      accessibleName: "Heat, " + (zone.t.name || zone.t.alias)
                       active: parent.s.mode === "heat"; enabled: parent.usable
-                      onClicked: zone.c.act(["mode", "heat"])
+                      hasCursor: root.cursorOn("mode", zone.index, 0)
+                      onClicked: root.activateMode(zone.index, 0)
                     }
                     Chip {
                       width: parent.cell; label: "COOL"; glyph: "󰜗"; activeTint: root.cool
+                      accessibleName: "Cool, " + (zone.t.name || zone.t.alias)
                       active: parent.s.mode === "cool"; enabled: parent.usable
-                      onClicked: zone.c.act(["mode", "cool"])
+                      hasCursor: root.cursorOn("mode", zone.index, 1)
+                      onClicked: root.activateMode(zone.index, 1)
                     }
                     Chip {
                       width: parent.cell; label: "OFF"; glyph: "󰤆"; activeTint: root.fg
+                      accessibleName: "Off, " + (zone.t.name || zone.t.alias)
                       active: parent.s.mode === "off"; enabled: parent.usable
-                      onClicked: zone.c.act(["mode", "off"])
+                      hasCursor: root.cursorOn("mode", zone.index, 2)
+                      onClicked: root.activateMode(zone.index, 2)
                     }
                     Chip {
                       // ecobee's energy-saving comfort setting; pressed again, back to the schedule.
                       width: parent.cell; label: "AWAY"; glyph: "󰌪"
+                      accessibleName: "Away, " + (zone.t.name || zone.t.alias)
                       active: parent.s.comfort === "away"; enabled: parent.usable
-                      onClicked: zone.c.act([parent.s.comfort === "away" ? "resume" : "away"])
+                      hasCursor: root.cursorOn("mode", zone.index, 3)
+                      onClicked: root.activateMode(zone.index, 3)
                     }
                     Chip {
                       // Clears a hold (manual setpoint or comfort) and resumes the schedule.
                       width: parent.cell; label: "RESUME"; glyph: "󰥔"
+                      accessibleName: "Resume schedule, " + (zone.t.name || zone.t.alias)
                       enabled: parent.usable && (parent.s.comfort === "hold" || parent.s.comfort === "away")
-                      onClicked: zone.c.act(["resume"])
+                      hasCursor: root.cursorOn("mode", zone.index, 4)
+                      onClicked: root.activateMode(zone.index, 4)
                     }
                   }
 
@@ -769,12 +881,12 @@ Panel {
                       readonly property var delta: root.targetDelta(zone.t)
                       anchors.right: parent.right
                       anchors.verticalCenter: parent.verticalCenter
-                      textFormat: Text.StyledText
-                      text: delta === null ? "" : "Target Δ <font color='" + (delta >= 0 ? root.good : root.accent) + "'>"
-                        + (delta >= 0 ? "+" : "") + delta.toFixed(1) + "°" + (zone.t.units === "C" ? "C" : "F") + "</font>"
-                      color: root.dim
+                      // In words, so it doesn't rely on color: green means there's nothing to do.
+                      textFormat: Text.PlainText
+                      text: root.targetWords(zone.t)
+                      color: delta === null ? root.dim : delta >= 0 ? root.good : root.accent
                       font.family: root.font
-                      font.pixelSize: Style.font.bodySmall
+                      font.pixelSize: Style.font.body
                     }
                   }
                 }
@@ -799,6 +911,8 @@ Panel {
             enabled: root.cliOk
             anchors.horizontalCenter: parent.horizontalCenter
             text: "+ ADD THERMOSTAT"
+            accessibleName: "Add a thermostat"
+            hasCursor: root.cursorOn("add", "", 0)
             onClicked: root.startAdding()
           }
 
@@ -822,6 +936,7 @@ Panel {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   text: "×"
+                  accessibleName: "Close Add thermostat"
                   onClicked: root.stopAdding()
                 }
 
@@ -859,8 +974,15 @@ Panel {
                   color: root.accent
                   font.family: root.font
                   font.pixelSize: Style.font.iconLarge
+                  Accessible.ignored: true  // the text beside it says what's happening
+                  // Spins for 5 s per step, then rests (no endless motion).
+                  property bool settled: false
+                  readonly property string stage: root.pairStage
+                  onStageChanged: { settled = false; rotation = 0; settle.restart() }
+                  onVisibleChanged: { settled = false; rotation = 0; if (visible) settle.restart() }
+                  Timer { id: settle; interval: 5000; onTriggered: { spinner.settled = true; spinner.rotation = 0 } }
                   RotationAnimation on rotation {
-                    running: spinner.visible
+                    running: spinner.visible && !spinner.settled
                     from: 0; to: 360; duration: 1200; loops: Animation.Infinite
                   }
                 }
@@ -878,11 +1000,19 @@ Panel {
                   }
                   Text {
                     textFormat: Text.PlainText
+                    visible: spinner.settled
+                    text: "Still working…"
+                    color: root.dim
+                    font.family: root.font
+                    font.pixelSize: Style.font.body
+                  }
+                  Text {
+                    textFormat: Text.PlainText
                     visible: root.pairStage === "starting"
                     text: "It shows a fresh code once pairing starts."
                     color: root.dim
                     font.family: root.font
-                    font.pixelSize: Style.font.bodySmall
+                    font.pixelSize: Style.font.body
                   }
                 }
               }
@@ -925,7 +1055,7 @@ Panel {
                         text: [deviceRow.modelData.model, deviceRow.modelData.address].filter(x => x).join(" · ") || "paired as " + deviceRow.modelData.alias
                         color: root.dim
                         font.family: root.font
-                        font.pixelSize: Style.font.caption
+                        font.pixelSize: Style.font.body
                       }
                     }
 
@@ -942,6 +1072,7 @@ Panel {
                       TextButton {
                         visible: deviceRow.ready
                         text: "PAIR"
+                        accessibleName: "Pair " + deviceRow.modelData.name
                         primary: true
                         onClicked: root.beginPair(deviceRow.modelData.id, deviceRow.modelData.name)
                       }
@@ -957,7 +1088,7 @@ Panel {
                   text: "Nothing is ready to pair. A thermostat pairs with one HomeKit controller: remove it from Apple Home, or reset HomeKit on it (Menu → Settings → HomeKit)."
                   color: root.dim
                   font.family: root.font
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: Style.font.body
                 }
 
                 TextButton {
@@ -987,7 +1118,7 @@ Panel {
                   text: "On the thermostat: Menu → Settings → HomeKit. It changes when pairing starts, so use the one on screen now."
                   color: root.dim
                   font.family: root.font
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: Style.font.body
                 }
                 Text {
                   textFormat: Text.PlainText
@@ -995,7 +1126,7 @@ Panel {
                   text: root.pairHint
                   color: root.cool
                   font.family: root.font
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: Style.font.body
                 }
                 Row {
                   spacing: Style.space(8)
@@ -1038,7 +1169,7 @@ Panel {
                     : "It appears in the bar once the watcher picks it up (a few seconds)."
                   color: root.dim
                   font.family: root.font
-                  font.pixelSize: Style.font.bodySmall
+                  font.pixelSize: Style.font.body
                 }
                 TextButton {
                   text: "DONE"
@@ -1135,14 +1266,20 @@ Panel {
     property string text: ""
     property bool primary: false
     property bool enabled: true
+    // The keyboard cursor is on it (see moveCursor), and what a screen reader says.
+    property bool hasCursor: false
+    property string accessibleName: ""
     signal clicked()
+    Accessible.role: Accessible.Button
+    Accessible.name: accessibleName || text
+    Accessible.onPressAction: if (enabled) clicked()
     width: textButtonLabel.implicitWidth + Style.space(22)
     height: Style.space(28)
     radius: Style.space(6)
     color: primary ? Util.alpha(root.accent, buttonMouse.containsMouse && enabled ? 0.26 : 0.16)
       : (buttonMouse.containsMouse && enabled ? Util.alpha(root.fg, 0.08) : "transparent")
-    border.color: primary ? Util.alpha(root.accent, 0.6) : Util.alpha(root.fg, 0.18)
-    border.width: 1
+    border.color: hasCursor || primary ? root.accent : root.outline
+    border.width: hasCursor ? 2 : 1
     opacity: enabled ? 1 : 0.4
 
     Text {
@@ -1169,13 +1306,18 @@ Panel {
     id: step
     property string text: ""
     property bool enabled: true
+    property bool hasCursor: false
+    property string accessibleName: ""
     signal clicked()
+    Accessible.role: Accessible.Button
+    Accessible.name: accessibleName || text
+    Accessible.onPressAction: if (enabled) clicked()
     width: Style.space(26)
     height: width
     radius: Style.space(5)
     color: stepMouse.containsMouse && enabled ? Util.alpha(root.accent, 0.18) : Util.alpha(root.fg, 0.06)
-    border.color: Util.alpha(root.fg, 0.18)
-    border.width: 1
+    border.color: hasCursor ? root.accent : root.outline
+    border.width: hasCursor ? 2 : 1
     opacity: enabled ? 1 : 0.35
 
     Text {
@@ -1204,12 +1346,17 @@ Panel {
     property bool active: false
     property bool enabled: true
     property color activeTint: root.accent
+    property bool hasCursor: false
+    property string accessibleName: ""
     signal clicked()
+    Accessible.role: Accessible.Button
+    Accessible.name: (accessibleName || label) + (active ? ", on" : "")
+    Accessible.onPressAction: if (enabled) clicked()
     height: Style.space(28)
     radius: Style.space(6)
     color: active ? Util.alpha(activeTint, 0.14) : (chipMouse.containsMouse && enabled ? Util.alpha(root.fg, 0.06) : "transparent")
-    border.color: active ? Util.alpha(activeTint, 0.6) : root.hairline
-    border.width: 1
+    border.color: hasCursor ? root.accent : active ? activeTint : root.outline
+    border.width: hasCursor ? 2 : 1
     opacity: enabled || active ? 1 : 0.4
 
     Row {
@@ -1251,14 +1398,20 @@ Panel {
     spacing: Style.space(6)
     TextButton {
       text: root.houseLabel("away", parent.house)
+      accessibleName: root.armed === "away:" + parent.house ? "Press again to confirm: " + text
+        : "Away for every thermostat" + (parent.house ? " at " + parent.house : "")
       primary: root.armed === "away:" + parent.house
       enabled: root.cliOk
+      hasCursor: root.cursorOn("house", parent.house, 0)
       onClicked: root.houseAction("away", parent.house)
     }
     TextButton {
       text: root.houseLabel("resume", parent.house)
+      accessibleName: root.armed === "resume:" + parent.house ? "Press again to confirm: " + text
+        : "Resume the schedule on every thermostat" + (parent.house ? " at " + parent.house : "")
       primary: root.armed === "resume:" + parent.house
       enabled: root.cliOk
+      hasCursor: root.cursorOn("house", parent.house, 1)
       onClicked: root.houseAction("resume", parent.house)
     }
   }
@@ -1270,6 +1423,9 @@ Panel {
     property var value: null
     property color tint: root.accent
     property string glyph: ""
+    property string accessibleName: ""
+    Accessible.role: Accessible.Indicator
+    Accessible.name: accessibleName
     readonly property real fraction: value === null || value === undefined ? 0
       : Math.max(0, Math.min(1, (value > 45 ? (value - 50) / 40 : (value - 10) / 22)))
     width: size
@@ -1315,6 +1471,10 @@ Panel {
     property color tint: root.accent
     property color emptyColor: root.dim
     property string fontFamily: ""
+    Accessible.role: Accessible.Graphic
+    Accessible.name: points.length < 2 ? "Trend: collecting readings"
+      : "Trend: " + points[0][1].toFixed(1) + " to " + points[points.length - 1][1].toFixed(1) + " degrees, low "
+        + Math.min(...points.map(p => p[1])).toFixed(1) + ", high " + Math.max(...points.map(p => p[1])).toFixed(1)
     onPointsChanged: sparkCanvas.requestPaint()
     onWidthChanged: sparkCanvas.requestPaint()
 
@@ -1325,7 +1485,7 @@ Panel {
       text: "collecting…"
       color: spark.emptyColor
       font.family: spark.fontFamily
-      font.pixelSize: Style.font.caption
+      font.pixelSize: Style.font.body
     }
 
     Canvas {
